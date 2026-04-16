@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>P2PNet — Crowd Intelligence</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Barlow:wght@300;400;600;700&family=Barlow+Condensed:wght@400;700&display=swap" rel="stylesheet">
+<script src="/socket.io/socket.io.js"></script>
+<style>
+  :root {
+    --bg:        #080b0f;
+    --panel:     #0d1117;
+    --border:    #1c2630;
+    --border2:   #243040;
+    --accent:    #00e5ff;
+    --accent2:   #ff3d57;
+    --accent3:   #39ff86;
+    --muted:     #3a4a5a;
+    --text:      #c8d8e8;
+    --text-dim:  #5a7080;
+    --mono:      'Share Tech Mono', monospace;
+    --sans:      'Barlow', sans-serif;
+    --cond:      'Barlow Condensed', sans-serif;
+  }
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html, body {
+    height: 100%;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 14px;
+    overflow: hidden;
+  }
+
+  .shell {
+    display: grid;
+    height: 100vh;
+    grid-template-rows: 52px 1fr;
+    grid-template-columns: 300px 1fr 280px;
+    grid-template-areas:
+      "header header header"
+      "left   feed   right";
+    gap: 1px;
+    background: var(--border);
+  }
+
+  header {
+    grid-area: header;
+    background: var(--panel);
+    display: flex;
+    align-items: center;
+    padding: 0 20px;
+    gap: 24px;
+    border-bottom: 1px solid var(--border2);
+  }
+  .logo {
+    font-family: var(--cond);
+    font-weight: 700;
+    font-size: 20px;
+    letter-spacing: 3px;
+    text-transform: uppercase;
+    color: var(--accent);
+  }
+  .logo span { color: var(--text-dim); font-weight: 400; }
+  .header-status { display: flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: 11px; color: var(--text-dim); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); transition: background .3s; }
+  .dot.live  { background: var(--accent3); box-shadow: 0 0 8px var(--accent3); animation: pulse 1.5s infinite; }
+  .dot.error { background: var(--accent2); }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+
+  #source-label { font-family: var(--mono); font-size: 11px; color: var(--accent); max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .header-right { margin-left: auto; display: flex; align-items: center; gap: 16px; }
+  #big-count { font-family: var(--cond); font-size: 32px; font-weight: 700; color: var(--accent); letter-spacing: 2px; transition: color .2s; }
+  .count-label { font-size: 10px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 2px; }
+  #fps-badge { font-family: var(--mono); font-size: 11px; color: var(--accent3); border: 1px solid var(--border2); padding: 2px 8px; border-radius: 2px; }
+
+  .panel { background: var(--panel); display: flex; flex-direction: column; overflow: hidden; }
+  .panel-title { padding: 10px 16px; font-family: var(--cond); font-size: 11px; font-weight: 700; letter-spacing: 3px; text-transform: uppercase; color: var(--text-dim); border-bottom: 1px solid var(--border); flex-shrink: 0; }
+
+  .left { grid-area: left; }
+  .left .panel-title { color: var(--accent); border-color: var(--accent); }
+
+  .tabs { display: flex; flex-shrink: 0; border-bottom: 1px solid var(--border); }
+  .tab { flex: 1; padding: 10px 4px; text-align: center; font-family: var(--cond); font-size: 11px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; color: var(--text-dim); cursor: pointer; border-bottom: 2px solid transparent; transition: color .2s, border-color .2s; }
+  .tab:hover { color: var(--text); }
+  .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+  .tab-content { display: none; padding: 16px; flex-direction: column; gap: 12px; overflow-y: auto; flex: 1; }
+  .tab-content.active { display: flex; }
+
+  label { font-size: 10px; font-weight: 600; letter-spacing: 2px; text-transform: uppercase; color: var(--text-dim); display: block; margin-bottom: 5px; }
+
+  input[type=text], input[type=number], input[type=url] {
+    width: 100%; background: var(--bg);
+    border: 1px solid var(--border2); color: var(--text);
+    padding: 8px 10px; font-family: var(--mono); font-size: 12px;
+    outline: none; border-radius: 2px; transition: border-color .2s;
+  }
+  input:focus { border-color: var(--accent); }
+
+  .dropzone { border: 2px dashed var(--border2); border-radius: 4px; padding: 24px 16px; text-align: center; cursor: pointer; transition: border-color .2s, background .2s; position: relative; }
+  .dropzone:hover, .dropzone.drag { border-color: var(--accent); background: rgba(0,229,255,.04); }
+  .dropzone input[type=file] { position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%; }
+  .dropzone-icon { font-size: 28px; margin-bottom: 8px; }
+  .dropzone-text { font-size: 11px; color: var(--text-dim); line-height: 1.6; }
+  .dropzone-text strong { color: var(--accent); }
+  #upload-name { font-family: var(--mono); font-size: 10px; color: var(--accent3); margin-top: 6px; min-height: 14px; }
+
+  .progress-wrap { background: var(--border); border-radius: 2px; height: 3px; overflow: hidden; display: none; }
+  .progress-bar  { height: 100%; width: 0; background: var(--accent); transition: width .1s; }
+
+  .btn { padding: 10px 16px; font-family: var(--cond); font-size: 13px; font-weight: 700; letter-spacing: 2px; text-transform: uppercase; border: none; border-radius: 2px; cursor: pointer; transition: opacity .2s, transform .1s; }
+  .btn:active { transform: scale(.97); }
+  .btn:disabled { opacity: .4; cursor: not-allowed; transform: none; }
+  .btn-primary { background: var(--accent); color: #000; }
+  .btn-primary:hover:not(:disabled) { opacity: .85; }
+  .btn-danger  { background: var(--accent2); color: #fff; }
+  .btn-danger:hover:not(:disabled)  { opacity: .85; }
+
+  .stop-row { padding: 12px 16px; border-top: 1px solid var(--border); flex-shrink: 0; }
+
+  .feed { grid-area: feed; position: relative; background: #000; display: flex; align-items: center; justify-content: center; }
+  #feed-img { max-width: 100%; max-height: 100%; object-fit: contain; display: block; image-rendering: auto; }
+  .feed-placeholder { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; pointer-events: none; }
+  .feed-placeholder svg { opacity: .12; }
+  .feed-placeholder p { font-family: var(--mono); font-size: 11px; color: var(--text-dim); letter-spacing: 2px; }
+  #feed-img.hidden + .feed-placeholder { display: flex; }
+  #feed-img:not(.hidden) + .feed-placeholder { display: none; }
+  .feed::after { content: ''; position: absolute; inset: 0; pointer-events: none; background: repeating-linear-gradient(to bottom, transparent 0px, transparent 3px, rgba(0,0,0,.08) 3px, rgba(0,0,0,.08) 4px); }
+
+  .right { grid-area: right; }
+  #chart-canvas { width: 100%; height: 120px; display: block; flex-shrink: 0; }
+
+  .stats-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: var(--border); flex-shrink: 0; }
+  .stat-cell { background: var(--panel); padding: 12px; display: flex; flex-direction: column; gap: 2px; }
+  .stat-val { font-family: var(--cond); font-size: 22px; font-weight: 700; color: var(--accent); }
+  .stat-val.green { color: var(--accent3); }
+  .stat-val.red   { color: var(--accent2); }
+  .stat-key { font-size: 9px; letter-spacing: 2px; text-transform: uppercase; color: var(--text-dim); }
+
+  .log-area { flex: 1; overflow-y: auto; padding: 8px 12px; }
+  .log-line { font-family: var(--mono); font-size: 10px; color: var(--text-dim); line-height: 1.7; border-bottom: 1px solid rgba(255,255,255,.03); }
+  .log-line.warn { color: var(--accent2); }
+  .log-line.ok   { color: var(--accent3); }
+
+  ::-webkit-scrollbar { width: 4px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
+
+  @media (max-width: 900px) {
+    .shell { grid-template-columns: 1fr 1fr; grid-template-rows: 52px auto 1fr; grid-template-areas: "header header" "left right" "feed feed"; overflow-y: auto; }
+    html, body { overflow: auto; }
+  }
+</style>
+</head>
+<body>
+<div class="shell">
+
+  <!-- Header -->
+  <header>
+    <div class="logo">P2P<span>Net</span></div>
+    <div class="header-status">
+      <div class="dot" id="status-dot"></div>
+      <span id="status-text">IDLE</span>
+    </div>
+    <div id="source-label">—</div>
+    <div class="header-right">
+      <div>
+        <div class="count-label">People</div>
+        <div id="big-count">—</div>
+      </div>
+      <div id="fps-badge">0.0 fps</div>
+    </div>
+  </header>
+
+  <!-- Left: controls -->
+  <div class="panel left">
+    <div class="panel-title">Input Source</div>
+    <div class="tabs">
+      <div class="tab active" data-tab="upload">Upload</div>
+      <div class="tab" data-tab="rtsp">RTSP</div>
+      <div class="tab" data-tab="webcam">Webcam</div>
+    </div>
+
+    <!-- Upload -->
+    <div class="tab-content active" id="tab-upload">
+      <div class="dropzone" id="dropzone">
+        <input type="file" id="file-input" accept="image/*,video/*">
+        <div class="dropzone-icon">📂</div>
+        <div class="dropzone-text">
+          <strong>Click or drag</strong><br>
+          Images: JPG PNG BMP<br>
+          Video: MP4 AVI MKV MOV
+        </div>
+        <div id="upload-name"></div>
+      </div>
+      <div class="progress-wrap" id="progress-wrap">
+        <div class="progress-bar" id="progress-bar"></div>
+      </div>
+      <button class="btn btn-primary" id="btn-upload">▶ START INFERENCE</button>
+    </div>
+
+    <!-- RTSP -->
+    <div class="tab-content" id="tab-rtsp">
+      <div>
+        <label>RTSP URL</label>
+        <input type="url" id="rtsp-url" placeholder="rtsp://user:pass@192.168.1.x:554/stream">
+      </div>
+      <div>
+        <label>Reconnect delay (s)</label>
+        <input type="number" id="rtsp-reconnect" value="5" min="0" max="60">
+      </div>
+      <button class="btn btn-primary" id="btn-rtsp">▶ CONNECT STREAM</button>
+    </div>
+
+    <!-- Webcam -->
+    <div class="tab-content" id="tab-webcam">
+      <div>
+        <label>Camera index</label>
+        <input type="number" id="cam-index" value="0" min="0" max="9">
+      </div>
+      <p style="font-size:11px;color:var(--text-dim);line-height:1.6">
+        Index 0 = default camera on the server machine.<br>
+        USB cameras use indices 1, 2, …
+      </p>
+      <button class="btn btn-primary" id="btn-webcam">▶ START WEBCAM</button>
+    </div>
+
+    <div class="stop-row">
+      <button class="btn btn-danger" id="btn-stop" style="width:100%">■ STOP</button>
+    </div>
+  </div>
+
+  <!-- Feed -->
+  <div class="feed panel">
+    <img id="feed-img" class="hidden" alt="Live feed">
+    <div class="feed-placeholder">
+      <svg width="80" height="80" viewBox="0 0 80 80" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <rect x="4" y="14" width="72" height="52" rx="4" stroke="#c8d8e8" stroke-width="2"/>
+        <circle cx="40" cy="40" r="14" stroke="#c8d8e8" stroke-width="2"/>
+        <circle cx="40" cy="40" r="5" fill="#c8d8e8"/>
+      </svg>
+      <p>AWAITING FEED</p>
+    </div>
+  </div>
+
+  <!-- Right: stats -->
+  <div class="panel right">
+    <div class="panel-title">Telemetry</div>
+    <canvas id="chart-canvas"></canvas>
+    <div class="stats-grid">
+      <div class="stat-cell"><div class="stat-val" id="stat-count">—</div><div class="stat-key">Current count</div></div>
+      <div class="stat-cell"><div class="stat-val green" id="stat-fps">—</div><div class="stat-key">FPS</div></div>
+      <div class="stat-cell"><div class="stat-val" id="stat-ms">—</div><div class="stat-key">Latency ms</div></div>
+      <div class="stat-cell"><div class="stat-val" id="stat-frames">0</div><div class="stat-key">Frames</div></div>
+      <div class="stat-cell"><div class="stat-val" id="stat-peak">—</div><div class="stat-key">Peak count</div></div>
+      <div class="stat-cell"><div class="stat-val" id="stat-avg">—</div><div class="stat-key">Avg count</div></div>
+    </div>
+    <div class="panel-title" style="margin-top:1px">Event Log</div>
+    <div class="log-area" id="log-area"></div>
+  </div>
+
+</div>
+
+<script>
+// ── Socket ────────────────────────────────────────────────────────────────────
+const socket = io();
+
+// ── State ─────────────────────────────────────────────────────────────────────
+let selectedFile  = null;
+let countHistory  = [];
+const MAX_HISTORY = 80;
+let peakCount = 0, sumCount = 0, frameTotal = 0;
+
+// Button guard — prevents double-firing
+let actionPending = false;
+function lockButtons(ms = 800) {
+  if (actionPending) return false;
+  actionPending = true;
+  document.querySelectorAll('.btn-primary').forEach(b => b.disabled = true);
+  setTimeout(() => {
+    actionPending = false;
+    document.querySelectorAll('.btn-primary').forEach(b => b.disabled = false);
+  }, ms);
+  return true;
+}
+
+// ── DOM refs ──────────────────────────────────────────────────────────────────
+const feedImg     = document.getElementById('feed-img');
+const bigCount    = document.getElementById('big-count');
+const fpsBadge    = document.getElementById('fps-badge');
+const statusDot   = document.getElementById('status-dot');
+const statusText  = document.getElementById('status-text');
+const sourceLabel = document.getElementById('source-label');
+const logArea     = document.getElementById('log-area');
+const canvas      = document.getElementById('chart-canvas');
+const ctx         = canvas.getContext('2d');
+
+// ── Tabs ──────────────────────────────────────────────────────────────────────
+document.querySelectorAll('.tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+    tab.classList.add('active');
+    document.getElementById('tab-' + tab.dataset.tab).classList.add('active');
+  });
+});
+
+// ── Drop zone ─────────────────────────────────────────────────────────────────
+const dropzone   = document.getElementById('dropzone');
+const fileInput  = document.getElementById('file-input');
+const uploadName = document.getElementById('upload-name');
+
+fileInput.addEventListener('change', () => {
+  if (fileInput.files[0]) { selectedFile = fileInput.files[0]; uploadName.textContent = selectedFile.name; }
+});
+dropzone.addEventListener('dragover',  e => { e.preventDefault(); dropzone.classList.add('drag'); });
+dropzone.addEventListener('dragleave', () => dropzone.classList.remove('drag'));
+dropzone.addEventListener('drop', e => {
+  e.preventDefault(); dropzone.classList.remove('drag');
+  if (e.dataTransfer.files[0]) { selectedFile = e.dataTransfer.files[0]; uploadName.textContent = selectedFile.name; }
+});
+
+// ── Upload — XHR with progress ────────────────────────────────────────────────
+document.getElementById('btn-upload').addEventListener('click', () => {
+  if (!lockButtons(1500)) return;
+  if (!selectedFile) { addLog('No file selected', 'warn'); actionPending = false; return; }
+
+  const fd = new FormData();
+  fd.append('file', selectedFile);
+
+  const pw = document.getElementById('progress-wrap');
+  const pb = document.getElementById('progress-bar');
+  pw.style.display = 'block'; pb.style.width = '0%';
+
+  const xhr = new XMLHttpRequest();
+  xhr.open('POST', '/api/upload');
+  xhr.upload.onprogress = e => {
+    if (e.lengthComputable) pb.style.width = (e.loaded / e.total * 100) + '%';
+  };
+  xhr.onload = () => {
+    pw.style.display = 'none';
+    if (xhr.status === 200) {
+      const r = JSON.parse(xhr.responseText);
+      addLog(`Inference started: ${r.file} [${r.type}]`, 'ok');
+      resetStats();
+    } else {
+      addLog('Upload failed: ' + xhr.responseText, 'warn');
+    }
+  };
+  xhr.onerror = () => { pw.style.display = 'none'; addLog('Upload error', 'warn'); };
+  xhr.send(fd);
+});
+
+// ── RTSP ──────────────────────────────────────────────────────────────────────
+document.getElementById('btn-rtsp').addEventListener('click', async () => {
+  if (!lockButtons()) return;
+  const url = document.getElementById('rtsp-url').value.trim();
+  if (!url) { addLog('Enter an RTSP URL', 'warn'); return; }
+  const reconnect = parseInt(document.getElementById('rtsp-reconnect').value) || 5;
+  const r = await post('/api/rtsp', { url, reconnect });
+  if (r.ok) { addLog(`RTSP: ${url}`, 'ok'); resetStats(); }
+  else addLog('RTSP error: ' + JSON.stringify(r), 'warn');
+});
+
+// ── Webcam ────────────────────────────────────────────────────────────────────
+document.getElementById('btn-webcam').addEventListener('click', async () => {
+  if (!lockButtons()) return;
+  const index = parseInt(document.getElementById('cam-index').value) || 0;
+  const r = await post('/api/webcam', { index });
+  if (r.ok) { addLog(`Webcam ${index} started`, 'ok'); resetStats(); }
+  else addLog('Webcam error: ' + JSON.stringify(r), 'warn');
+});
+
+// ── Stop ──────────────────────────────────────────────────────────────────────
+document.getElementById('btn-stop').addEventListener('click', async () => {
+  await post('/api/stop', {});
+  addLog('Stopped by user', 'warn');
+});
+
+// ── Socket events ─────────────────────────────────────────────────────────────
+socket.on('status', ({ running, source }) => {
+  if (running) {
+    statusDot.className = 'dot live';
+    statusText.textContent = 'LIVE';
+    sourceLabel.textContent = source || '—';
+  } else {
+    statusDot.className = 'dot';
+    statusText.textContent = 'IDLE';
+    sourceLabel.textContent = '—';
+  }
+});
+
+socket.on('frame', ({ jpeg, count, ms, fps, frame }) => {
+  feedImg.src = 'data:image/jpeg;base64,' + jpeg;
+  feedImg.classList.remove('hidden');
+
+  bigCount.textContent = count;
+  fpsBadge.textContent = fps.toFixed(1) + ' fps';
+
+  document.getElementById('stat-count').textContent  = count;
+  document.getElementById('stat-fps').textContent    = fps.toFixed(1);
+  document.getElementById('stat-ms').textContent     = ms.toFixed(0);
+  document.getElementById('stat-frames').textContent = frame + 1;
+
+  countHistory.push(count);
+  if (countHistory.length > MAX_HISTORY) countHistory.shift();
+  frameTotal++; sumCount += count;
+  if (count > peakCount) peakCount = count;
+  document.getElementById('stat-peak').textContent = peakCount;
+  document.getElementById('stat-avg').textContent  = (sumCount / frameTotal).toFixed(1);
+
+  drawChart();
+});
+
+socket.on('done', ({ frames, mean_fps }) => {
+  addLog(`Done — ${frames} frames @ ${mean_fps} fps avg`, 'ok');
+  statusDot.className = 'dot';
+  statusText.textContent = 'DONE';
+});
+
+socket.on('inferenceError', ({ msg }) => {
+  addLog('ERROR: ' + msg, 'warn');
+  statusDot.className = 'dot error';
+  statusText.textContent = 'ERROR';
+});
+
+socket.on('log', ({ msg }) => addLog(msg));
+
+// ── Chart ─────────────────────────────────────────────────────────────────────
+function resizeCanvas() { canvas.width = canvas.offsetWidth; canvas.height = canvas.offsetHeight; }
+window.addEventListener('resize', () => { resizeCanvas(); drawChart(); });
+resizeCanvas();
+
+function drawChart() {
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+  if (countHistory.length < 2) return;
+  const maxVal = Math.max(...countHistory, 1);
+  const step   = W / (MAX_HISTORY - 1);
+
+  ctx.strokeStyle = 'rgba(28,38,48,.8)'; ctx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    const y = H - (i / 4) * H;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+  }
+
+  const grad = ctx.createLinearGradient(0, 0, 0, H);
+  grad.addColorStop(0, 'rgba(0,229,255,.35)');
+  grad.addColorStop(1, 'rgba(0,229,255,.00)');
+  ctx.beginPath();
+  countHistory.forEach((v, i) => {
+    const x = i * step, y = H - (v / maxVal) * (H - 6);
+    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  });
+  ctx.lineTo((countHistory.length - 1) * step, H);
+  ctx.lineTo(0, H); ctx.closePath();
+  ctx.fillStyle = grad; ctx.fill();
+
+  ctx.beginPath(); ctx.strokeStyle = 'rgba(0,229,255,.9)'; ctx.lineWidth = 1.5;
+  countHistory.forEach((v, i) => {
+    const x = i * step, y = H - (v / maxVal) * (H - 6);
+    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+async function post(url, body) {
+  try {
+    const r = await fetch(url, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+    return await r.json();
+  } catch (e) { return { ok: false, error: e.message }; }
+}
+
+function addLog(msg, cls = '') {
+  const line = document.createElement('div');
+  line.className = 'log-line' + (cls ? ' ' + cls : '');
+  const ts = new Date().toTimeString().slice(0, 8);
+  line.textContent = `[${ts}] ${msg}`;
+  logArea.appendChild(line);
+  logArea.scrollTop = logArea.scrollHeight;
+  while (logArea.children.length > 200) logArea.removeChild(logArea.firstChild);
+}
+
+function resetStats() {
+  countHistory = []; peakCount = 0; sumCount = 0; frameTotal = 0;
+  feedImg.src = ''; feedImg.classList.add('hidden');
+  bigCount.textContent = '—';
+  ['stat-count','stat-fps','stat-ms','stat-peak','stat-avg'].forEach(id => {
+    document.getElementById(id).textContent = '—';
+  });
+  document.getElementById('stat-frames').textContent = '0';
+  drawChart();
+}
+
+addLog('Dashboard ready — choose an input source', 'ok');
+</script>
+</body>
+</html>
