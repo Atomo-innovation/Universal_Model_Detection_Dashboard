@@ -1,14 +1,15 @@
 /**
  * ASNN Detection Dashboard Server
  * Runs on aarch64 device, accessible from any browser on the network
- * 
+ *
  * Features:
  *  - Serves dashboard UI over HTTP
  *  - Scans /models directory for available models (reads data.yaml)
  *  - Accepts file uploads (video/image)
  *  - Spawns Python inference processes
+ *    · person model  → person.py --json-stream  (YOLO26s, RTSP-only)
+ *    · all others    → detect.py                (generic YOLOv3-style)
  *  - Streams output frames + logs via WebSocket
- *  - Streams RTSP/webcam output back to browser
  */
 
 const express    = require('express');
@@ -29,11 +30,12 @@ const app    = express();
 const server = http.createServer(app);
 const wss    = new WebSocket.Server({ server });
 
-const PORT         = process.env.PORT || 8080;
-const MODELS_DIR   = process.env.MODELS_DIR  || path.join(__dirname, 'models');
-const UPLOADS_DIR  = process.env.UPLOADS_DIR || path.join(__dirname, 'uploads');
-const PUBLIC_DIR   = path.join(__dirname, 'public');
+const PORT          = 8050;
+const MODELS_DIR    = process.env.MODELS_DIR  || path.join(__dirname, 'models');
+const UPLOADS_DIR   = process.env.UPLOADS_DIR || path.join(__dirname, 'uploads');
+const PUBLIC_DIR    = path.join(__dirname, 'public');
 const DETECT_SCRIPT = process.env.DETECT_SCRIPT || path.join(__dirname, 'detect.py');
+const PERSON_SCRIPT = process.env.PERSON_SCRIPT || path.join(__dirname, 'person.py');
 
 // Ensure dirs exist
 [MODELS_DIR, UPLOADS_DIR, PUBLIC_DIR].forEach(d => fs.mkdirSync(d, { recursive: true }));
@@ -53,24 +55,23 @@ const upload = multer({ storage, limits: { fileSize: 2 * 1024 * 1024 * 1024 } })
 
 // ── Express middleware ───────────────────────────────────────────
 app.use(express.json());
-app.use(express.static(PUBLIC_DIR));        // root: /logo.png, /index.html etc.
-app.use('/public', express.static(PUBLIC_DIR));  // keep /public/ for compat
+app.use(express.static(PUBLIC_DIR));
+app.use('/public',  express.static(PUBLIC_DIR));
 app.use('/uploads', express.static(UPLOADS_DIR));
 
 // ── API: List available models ───────────────────────────────────
 app.get('/api/models', (req, res) => {
-  const models = scanModels();
-  res.json({ models });
+  res.json({ models: scanModels() });
 });
 
 // ── API: Upload file ─────────────────────────────────────────────
 app.post('/api/upload', upload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
   res.json({
-    filename: req.file.filename,
+    filename:     req.file.filename,
     originalname: req.file.originalname,
-    path: req.file.path,
-    size: req.file.size
+    path:         req.file.path,
+    size:         req.file.size
   });
 });
 
@@ -95,24 +96,29 @@ app.get('/api/system', (req, res) => {
 
 // ── API: Start inference session ─────────────────────────────────
 app.post('/api/inference/start', (req, res) => {
-  const { modelName, inputType, inputValue, objThresh, nmsThresh, platform, logLevel, sessionId: existingId } = req.body;
+  const { modelName, inputType, inputValue, objThresh, nmsThresh,
+          platform, logLevel, sessionId: existingId } = req.body;
 
-  // Find model
   const models = scanModels();
   const model  = models.find(m => m.name === modelName);
   if (!model) return res.status(404).json({ error: `Model '${modelName}' not found` });
 
-  // Stop existing session if reusing
   const sid = existingId || uuidv4();
   if (sessions.has(sid)) stopSession(sid);
 
-  // Build Python args
-  const args = buildPythonArgs({ model, inputType, inputValue, objThresh, nmsThresh, platform, logLevel });
+  const isPerson = isPersonModel(model);
+  const args     = isPerson
+    ? buildPersonArgs({ model, inputType, inputValue, objThresh, nmsThresh, logLevel })
+    : buildDetectArgs({ model, inputType, inputValue, objThresh, nmsThresh, platform, logLevel });
 
-  // Store session metadata (process spawned when WS connects)
-  sessions.set(sid, { model, args, inputType, inputValue, status: 'pending', proc: null, ws: null });
+  sessions.set(sid, {
+    model, args, inputType, inputValue,
+    isPerson,
+    status: 'pending', proc: null, ws: null
+  });
 
-  res.json({ sessionId: sid, command: `python3 detect.py ${args.join(' ')}` });
+  const script = isPerson ? 'person.py' : 'detect.py';
+  res.json({ sessionId: sid, command: `python3 ${script} ${args.join(' ')}` });
 });
 
 // ── API: Stop inference session ──────────────────────────────────
@@ -124,20 +130,20 @@ app.post('/api/inference/stop/:sid', (req, res) => {
 // ── API: List active sessions ────────────────────────────────────
 app.get('/api/inference/sessions', (req, res) => {
   const list = [];
-  sessions.forEach((v, k) => list.push({ id: k, status: v.status, model: v.model?.name, inputType: v.inputType }));
+  sessions.forEach((v, k) => list.push({
+    id: k, status: v.status, model: v.model?.name,
+    inputType: v.inputType, isPerson: v.isPerson
+  }));
   res.json({ sessions: list });
 });
 
-// ── Serve main dashboard HTML ────────────────────────────────────
-app.get('/', (req, res) => {
-  res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
-});
+// ── Serve main dashboard ─────────────────────────────────────────
+app.get('/', (req, res) => res.sendFile(path.join(PUBLIC_DIR, 'index.html')));
 
-// Catch-all — only redirect HTML navigation, not assets
 app.get('*', (req, res) => {
-  const ext = require('path').extname(req.path);
+  const ext = path.extname(req.path);
   if (ext && ext !== '.html') return res.status(404).send('Not found');
-  res.sendFile(require('path').join(PUBLIC_DIR, 'index.html'));
+  res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
 });
 
 // ── WebSocket: real-time inference stream ────────────────────────
@@ -147,70 +153,61 @@ wss.on('connection', (ws, req) => {
   ws.on('message', (raw) => {
     let msg;
     try { msg = JSON.parse(raw); } catch(e) { return; }
-
     switch(msg.type) {
-      case 'attach':   handleAttach(ws, msg);   break;
-      case 'start':    handleStart(ws, msg);     break;
-      case 'stop':     handleStop(ws, msg);      break;
-      case 'ping':     ws.send(JSON.stringify({ type: 'pong' })); break;
+      case 'attach': handleAttach(ws, msg); break;
+      case 'start':  handleStart(ws, msg);  break;
+      case 'stop':   handleStop(ws, msg);   break;
+      case 'ping':   ws.send(JSON.stringify({ type: 'pong' })); break;
     }
   });
 
-  ws.on('close', () => {
-    console.log('[WS] Client disconnected');
-    // Don't stop inference on disconnect — allow re-attach
-  });
-
+  ws.on('close', () => console.log('[WS] Client disconnected'));
   ws.on('error', (e) => console.error('[WS] Error:', e.message));
 });
 
-// ── WS: attach to existing session ──────────────────────────────
+// ── WS handlers ─────────────────────────────────────────────────
 function handleAttach(ws, msg) {
-  const { sessionId } = msg;
-  const session = sessions.get(sessionId);
+  const session = sessions.get(msg.sessionId);
   if (!session) { ws.send(JSON.stringify({ type: 'error', message: 'Session not found' })); return; }
   session.ws = ws;
-  wsend(ws, { type: 'attached', sessionId, status: session.status });
+  wsend(ws, { type: 'attached', sessionId: msg.sessionId, status: session.status });
 }
 
-// ── WS: start inference ──────────────────────────────────────────
 function handleStart(ws, msg) {
-  const { sessionId } = msg;
-  let session = sessions.get(sessionId);
+  const session = sessions.get(msg.sessionId);
   if (!session) { wsend(ws, { type: 'error', message: 'Call /api/inference/start first' }); return; }
-
-  session.ws = ws;
+  session.ws     = ws;
   session.status = 'running';
-  sessions.set(sessionId, session);
-
+  sessions.set(msg.sessionId, session);
   wsend(ws, { type: 'status', status: 'starting', message: 'Spawning inference process...' });
-
-  // Spawn Python detect.py
-  spawnInference(sessionId, session);
+  spawnInference(msg.sessionId, session);
 }
 
-// ── WS: stop inference ───────────────────────────────────────────
 function handleStop(ws, msg) {
   stopSession(msg.sessionId);
   wsend(ws, { type: 'status', status: 'stopped' });
 }
 
-// ── Spawn Python inference process ──────────────────────────────
+// ── Spawn inference process ──────────────────────────────────────
 function spawnInference(sid, session) {
-  const { args, model, inputType, ws } = session;
+  const { args, isPerson, ws } = session;
 
-  // Check if detect.py exists
-  if (!fs.existsSync(DETECT_SCRIPT)) {
-    // Use mock script for development/demo
-    wsend(ws, { type: 'log', level: 'warn', message: `detect.py not found at ${DETECT_SCRIPT} — using simulation mode` });
+  // Pick the right script
+  const scriptPath = isPerson ? PERSON_SCRIPT : DETECT_SCRIPT;
+
+  if (!fs.existsSync(scriptPath)) {
+    wsend(ws, {
+      type: 'log', level: 'warn',
+      message: `${path.basename(scriptPath)} not found at ${scriptPath} — using simulation mode`
+    });
     startSimulation(sid, session);
     return;
   }
 
   let proc;
   try {
-    proc = spawn('python3', [DETECT_SCRIPT, ...args], {
-      cwd: path.dirname(DETECT_SCRIPT),
+    proc = spawn('python3', [scriptPath, ...args], {
+      cwd: path.dirname(scriptPath),
       env: { ...process.env, PYTHONUNBUFFERED: '1' }
     });
   } catch(e) {
@@ -220,10 +217,9 @@ function spawnInference(sid, session) {
 
   session.proc = proc;
   sessions.set(sid, session);
-
   wsend(ws, { type: 'status', status: 'running', pid: proc.pid });
 
-  // Stream stdout (JSON lines from detect.py)
+  // Stream stdout — JSON lines from both detect.py and person.py --json-stream
   let buf = '';
   proc.stdout.on('data', (chunk) => {
     buf += chunk.toString();
@@ -231,11 +227,20 @@ function spawnInference(sid, session) {
     buf = lines.pop();
     lines.forEach(line => {
       if (!line.trim()) return;
-      // Try JSON (structured output), else plain log
       try {
         const data = JSON.parse(line);
-        wsend(ws, { type: 'inference', ...data });
+        if (data.type === 'log') {
+          // Explicit log line: {type:'log', level, message}
+          wsend(ws, data);
+        } else if (data.frame !== undefined) {
+          // Inference frame: {frame, fps, inference_ms, detections, jpeg}
+          wsend(ws, { type: 'inference', ...data });
+        } else {
+          // Other structured output
+          wsend(ws, { type: data.type || 'log', ...data });
+        }
       } catch(e) {
+        // Plain text line → log entry
         wsend(ws, { type: 'log', level: 'info', message: line });
       }
     });
@@ -258,9 +263,9 @@ function spawnInference(sid, session) {
   });
 }
 
-// ── Simulation mode (when no real detect.py) ────────────────────
+// ── Simulation mode (no script available) ───────────────────────
 function startSimulation(sid, session) {
-  const { model, inputType, ws } = session;
+  const { model, ws } = session;
   let frame = 0;
   const classes = model.classes || ['Object'];
 
@@ -269,18 +274,16 @@ function startSimulation(sid, session) {
   const interval = setInterval(() => {
     const s = sessions.get(sid);
     if (!s || s.status !== 'running') { clearInterval(interval); return; }
-
     frame++;
     const dets = [];
     const count = Math.random() > 0.4 ? Math.floor(Math.random() * 3) + 1 : 0;
     for (let i = 0; i < count; i++) {
       const cls = Math.floor(Math.random() * classes.length);
-      const score = 0.4 + Math.random() * 0.55;
       const x1 = Math.random() * 0.6, y1 = Math.random() * 0.6;
       dets.push({
-        class_id: cls,
+        class_id:   cls,
         class_name: classes[cls],
-        score: parseFloat(score.toFixed(3)),
+        score:      parseFloat((0.4 + Math.random() * 0.55).toFixed(3)),
         box: [
           parseFloat(x1.toFixed(4)), parseFloat(y1.toFixed(4)),
           parseFloat(Math.min(x1 + 0.1 + Math.random() * 0.25, 1).toFixed(4)),
@@ -288,20 +291,16 @@ function startSimulation(sid, session) {
         ]
       });
     }
-
     wsend(ws, {
-      type: 'inference',
-      frame,
+      type: 'inference', frame,
       fps: parseFloat((15 + Math.random() * 10).toFixed(1)),
       inference_ms: parseFloat((8 + Math.random() * 12).toFixed(1)),
-      detections: dets,
-      simulated: true
+      detections: dets, simulated: true
     });
-
     if (frame % 30 === 0) {
       wsend(ws, { type: 'log', level: 'info', message: `[SIM] Frame ${frame} | ${dets.length} detections` });
     }
-  }, 66); // ~15fps simulation
+  }, 66);
 
   session.simInterval = interval;
   sessions.set(sid, session);
@@ -311,18 +310,24 @@ function startSimulation(sid, session) {
 function stopSession(sid) {
   const session = sessions.get(sid);
   if (!session) return;
-
   if (session.proc) {
     try { session.proc.kill('SIGTERM'); } catch(e) {}
     session.proc = null;
   }
-  if (session.simInterval) {
-    clearInterval(session.simInterval);
-    session.simInterval = null;
-  }
+  if (session.simInterval) { clearInterval(session.simInterval); session.simInterval = null; }
   session.status = 'stopped';
   sessions.set(sid, session);
   console.log(`[${sid}] Session stopped`);
+}
+
+// ── Detect whether this model should use person.py ───────────────
+function isPersonModel(model) {
+  // Match if the model folder name is exactly "person" (case-insensitive)
+  // or the model's single class is "person"
+  if (model.name.toLowerCase() === 'person') return true;
+  if (model.classes && model.classes.length === 1 &&
+      model.classes[0].toLowerCase() === 'person') return true;
+  return false;
 }
 
 // ── Scan /models directory ───────────────────────────────────────
@@ -335,23 +340,20 @@ function scanModels() {
     .map(d => d.name);
 
   for (const name of dirs) {
-    const dir = path.join(MODELS_DIR, name);
+    const dir   = path.join(MODELS_DIR, name);
     const files = fs.readdirSync(dir);
 
-    // Find .nb file
-    const nbFile  = files.find(f => f.endsWith('.nb'));
-    // Find .so library
-    const soFile  = files.find(f => f.endsWith('.so'));
-    // Find data.yaml
+    const nbFile   = files.find(f => f.endsWith('.nb'));
+    const soFile   = files.find(f => f.endsWith('.so'));
     const yamlFile = files.find(f => f === 'data.yaml' || f === 'dataset.yaml' || f.endsWith('.yaml'));
 
-    if (!nbFile || !soFile) continue; // skip incomplete model dirs
+    if (!nbFile || !soFile) continue;
 
     const model = {
       name,
       dir,
-      nb:  nbFile,
-      lib: soFile,
+      nb:       nbFile,
+      lib:      soFile,
       nb_path:  path.join(dir, nbFile),
       lib_path: path.join(dir, soFile),
       classes:  [name.charAt(0).toUpperCase() + name.slice(1)],
@@ -360,16 +362,16 @@ function scanModels() {
       yaml:     yamlFile || null
     };
 
-    // Parse data.yaml if present
     if (yamlFile && YAML) {
       try {
-        const raw = fs.readFileSync(path.join(dir, yamlFile), 'utf8');
+        const raw    = fs.readFileSync(path.join(dir, yamlFile), 'utf8');
         const parsed = YAML.parse(raw);
         if (parsed.names) {
-          const names = Array.isArray(parsed.names) ? parsed.names : Object.values(parsed.names);
-          model.classes = names;
-          model.num_cls = names.length;
-          model.listsize = model.num_cls + 64; // NUM_CLS + 64 (4 * 16 for DFL)
+          const names = Array.isArray(parsed.names)
+            ? parsed.names : Object.values(parsed.names);
+          model.classes  = names;
+          model.num_cls  = names.length;
+          model.listsize = model.num_cls + 64;
         }
         if (parsed.nc) model.num_cls = parsed.nc;
       } catch(e) {
@@ -383,12 +385,38 @@ function scanModels() {
   return models;
 }
 
-// ── Build Python CLI args ────────────────────────────────────────
-function buildPythonArgs({ model, inputType, inputValue, objThresh, nmsThresh, platform, logLevel }) {
+// ── Build CLI args for detect.py ─────────────────────────────────
+function buildDetectArgs({ model, inputType, inputValue, objThresh, nmsThresh, platform, logLevel }) {
   const args = [
     '--model',   model.nb_path,
     '--library', model.lib_path,
     '--level',   String(logLevel || 0),
+  ];
+  if (inputType === 'rtsp') {
+    args.push('--type', 'rtsp', '--device', inputValue);
+  } else if (inputType === 'webcam') {
+    const [capType, devNum] = (inputValue || 'usb:0').split(':');
+    args.push('--type', capType || 'usb', '--device', devNum || '0');
+  } else if (inputType === 'video') {
+    args.push('--type', 'video', '--device', inputValue);
+  } else if (inputType === 'image') {
+    args.push('--type', 'image', '--device', inputValue);
+  }
+  if (objThresh) args.push('--obj-thresh', String(objThresh));
+  if (nmsThresh) args.push('--nms-thresh', String(nmsThresh));
+  if (platform)  args.push('--platform',   platform);
+  return args;
+}
+
+// ── Build CLI args for person.py ─────────────────────────────────
+// person.py uses the same --type / --device interface as detect.py.
+function buildPersonArgs({ model, inputType, inputValue, objThresh, nmsThresh, logLevel }) {
+  const args = [
+    '--model',        model.nb_path,
+    '--library',      model.lib_path,
+    '--level',        String(logLevel || 0),
+    '--json-stream',                // emit dashboard-compatible JSON lines on stdout
+    '--jpeg-quality', '75',
   ];
 
   if (inputType === 'rtsp') {
@@ -402,29 +430,20 @@ function buildPythonArgs({ model, inputType, inputValue, objThresh, nmsThresh, p
     args.push('--type', 'image', '--device', inputValue);
   }
 
-  if (objThresh) args.push('--obj-thresh', String(objThresh));
-  if (nmsThresh) args.push('--nms-thresh', String(nmsThresh));
-  if (platform)  args.push('--platform',   platform);
-
+  if (objThresh) args.push('--conf', String(objThresh));
+  if (nmsThresh) args.push('--nms',  String(nmsThresh));
   return args;
 }
 
 // ── Watch models dir for changes ─────────────────────────────────
 chokidar.watch(MODELS_DIR, { depth: 1, ignoreInitial: true })
-  .on('addDir', (p) => {
-    console.log(`[models] New model directory detected: ${p}`);
-    broadcastModels();
-  })
-  .on('add', (p) => {
-    if (p.endsWith('.nb') || p.endsWith('.so') || p.endsWith('.yaml')) {
-      console.log(`[models] New model file: ${p}`);
-      broadcastModels();
-    }
+  .on('addDir', () => broadcastModels())
+  .on('add',    (p) => {
+    if (p.endsWith('.nb') || p.endsWith('.so') || p.endsWith('.yaml')) broadcastModels();
   });
 
 function broadcastModels() {
-  const models = scanModels();
-  const msg = JSON.stringify({ type: 'models_updated', models });
+  const msg = JSON.stringify({ type: 'models_updated', models: scanModels() });
   wss.clients.forEach(c => { if (c.readyState === WebSocket.OPEN) c.send(msg); });
 }
 
@@ -443,16 +462,13 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`║  HTTP   : http://0.0.0.0:${PORT}                   ║`);
   console.log(`║  Models : ${MODELS_DIR}`);
   console.log(`║  Uploads: ${UPLOADS_DIR}`);
+  console.log(`║  Scripts: detect.py + person.py`);
   console.log('╠══════════════════════════════════════════════════╣');
-
-  // Print all network IPs
   try {
-    const ips = execSync("hostname -I 2>/dev/null || ip addr show | grep 'inet ' | awk '{print $2}' | cut -d/ -f1").toString().trim().split(/\s+/);
-    ips.forEach(ip => {
-      if (ip) console.log(`║  Access : http://${ip}:${PORT}`);
-    });
+    const ips = execSync("hostname -I 2>/dev/null || ip addr show | grep 'inet ' | awk '{print $2}' | cut -d/ -f1")
+      .toString().trim().split(/\s+/);
+    ips.forEach(ip => { if (ip) console.log(`║  Access : http://${ip}:${PORT}`); });
   } catch(e) {}
-
   console.log('╚══════════════════════════════════════════════════╝\n');
   console.log(`Models found: ${scanModels().length}`);
   console.log('Press Ctrl+C to stop\n');
